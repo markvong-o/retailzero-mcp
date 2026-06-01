@@ -25,6 +25,7 @@ const NAV_ITEMS: NavItem[] = [
     ],
   },
   { kind: "link", label: "Architecture", href: "/architecture" },
+  { kind: "link", label: "Values", href: "/values" },
 ];
 
 function isActive(pathname: string, href: string): boolean {
