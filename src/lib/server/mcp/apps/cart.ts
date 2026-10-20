@@ -116,8 +116,8 @@ const SCRIPT = /* js */ `
   function statusHtml(s) {
     var co = cart.checkout || {};
     if (s === "pending") {
-      return '<div class="status"><span class="dot"></span><div><strong>Waiting for your approval</strong>' +
-        'Approve the ' + money(co.pending.total) + ' purchase in the push notification on your phone.</div></div>';
+      return '<div class="status"><span class="dot"></span><div><strong>Approve on your phone</strong>' +
+        'We sent a push notification to your phone. Approve the ' + money(co.pending.total) + ' purchase to place your order.</div></div>';
     }
     if (s === "requested") {
       return '<div class="status"><span class="dot"></span><div><strong>Checkout in progress</strong>' +

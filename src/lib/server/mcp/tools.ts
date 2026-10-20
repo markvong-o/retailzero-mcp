@@ -14,7 +14,7 @@ import {
 } from "@/lib/server/cart";
 import { initiateCiba, pollCiba } from "@/lib/server/ciba";
 import { DEMO_PERSONA, ensurePersonaSeed, getUserKey, userSuffix } from "@/lib/server/mcp/user-identity";
-import { productUiToolMeta, cartUiToolMeta, registerAppViews } from "@/lib/server/mcp/apps";
+import { productUiToolMeta, cartUiToolMeta, checkoutUiToolMeta, registerAppViews } from "@/lib/server/mcp/apps";
 
 /**
  * Threshold above which checkout requires CIBA step-up approval from the
@@ -23,19 +23,31 @@ import { productUiToolMeta, cartUiToolMeta, registerAppViews } from "@/lib/serve
 const CIBA_REQUIRED_ABOVE = 100;
 
 /**
- * In-memory map of pending CIBA checkouts, keyed by auth_req_id. Holds the
- * cart snapshot captured at initiate time so complete_ciba_checkout can
- * finalize the exact same order the user approved on their device, even
- * if the cart was mutated afterward.
+ * In-memory map of CIBA checkouts, keyed by auth_req_id. Holds the cart
+ * snapshot captured at initiate time so complete_ciba_checkout can finalize
+ * the exact same order the user approved on their device, even if the cart
+ * was mutated afterward. Finished checkouts stay here with their outcome so
+ * the checkout view can show it.
  */
+type CibaCheckoutStatus = "awaiting_approval" | "confirmed" | "denied" | "expired" | "error";
 interface PendingCibaCheckout {
   user_email: string;
   items: Cart["items"];
   total: number;
   initiated_at: string;
   expires_at: number;
+  binding_message: string;
+  status: CibaCheckoutStatus;
+  order?: { order_id: string; total: number; created_at: string };
+  reason?: string;
 }
 const pendingCibaCheckouts = new Map<string, PendingCibaCheckout>();
+
+/** Settle a checkout. Only "confirmed" ever creates an order (see complete_ciba_checkout). */
+function settleCheckout(auth_req_id: string, status: Exclude<CibaCheckoutStatus, "awaiting_approval">, extra: { order?: PendingCibaCheckout["order"]; reason?: string } = {}): void {
+  const checkout = pendingCibaCheckouts.get(auth_req_id);
+  if (checkout && checkout.status === "awaiting_approval") Object.assign(checkout, { status, ...extra });
+}
 
 /** Most recent confirmed order per user, surfaced in the cart view. */
 const lastOrderByUser = new Map<string, { order_id: string; total: number; created_at: string }>();
@@ -65,13 +77,51 @@ function checkoutStatus(userEmail: string): CheckoutStatus {
  */
 function findPendingCheckout(userEmail: string): { auth_req_id: string; checkout: PendingCibaCheckout } | null {
   for (const [auth_req_id, checkout] of pendingCibaCheckouts) {
+    if (checkout.status !== "awaiting_approval") continue;
     if (checkout.expires_at <= Date.now()) {
-      pendingCibaCheckouts.delete(auth_req_id);
+      settleCheckout(auth_req_id, "expired", { reason: "The approval request expired." });
       continue;
     }
     if (checkout.user_email === userEmail) return { auth_req_id, checkout };
   }
   return null;
+}
+
+/** Look up a checkout, applying expiry first. */
+function getCheckout(auth_req_id: string): PendingCibaCheckout | undefined {
+  const checkout = pendingCibaCheckouts.get(auth_req_id);
+  if (checkout?.status === "awaiting_approval" && checkout.expires_at <= Date.now()) {
+    settleCheckout(auth_req_id, "expired", { reason: "The approval request expired." });
+  }
+  return checkout;
+}
+
+/** Checkout payload rendered by the MCP Apps checkout view. */
+function checkoutPayload(auth_req_id: string | null, c: {
+  status: CibaCheckoutStatus;
+  items: { product_id?: string; name: string; price: number; quantity: number }[];
+  total: number;
+  binding_message?: string;
+  expires_at?: number;
+  order?: PendingCibaCheckout["order"];
+  reason?: string;
+}) {
+  return {
+    checkout: {
+      auth_req_id,
+      status: c.status,
+      approval_required: auth_req_id !== null,
+      items: c.items.map((i) => {
+        const product = PRODUCTS.find((p) => p.id === i.product_id || p.name === i.name);
+        return { name: i.name, price: i.price, quantity: i.quantity, image_url: product?.image_url };
+      }),
+      total: c.total,
+      binding_message: c.binding_message ?? null,
+      expires_at: c.expires_at ? new Date(c.expires_at).toISOString() : null,
+      order: c.order ?? null,
+      reason: c.reason ?? null,
+    },
+  };
 }
 
 // In-memory order store (shared with orders.ts for consistency)
@@ -667,6 +717,7 @@ export function registerTools(server: McpServer): void {
         "invokes complete_ciba_checkout({ auth_req_id }) to finalize the order. " +
         "Requires the execute:purchase scope.",
       inputSchema: {},
+      _meta: checkoutUiToolMeta,
     },
     async (_params, { authInfo }) => {
       const start = Date.now();
@@ -724,9 +775,15 @@ export function registerTools(server: McpServer): void {
           total: order.total,
           ciba_required: false,
           message: `Order ${orderId} confirmed for $${order.total.toFixed(2)}.`,
+          ...checkoutPayload(null, {
+            status: "confirmed",
+            items: cart.items,
+            total: order.total,
+            order: { order_id: orderId, total: order.total, created_at: order.created_at },
+          }),
         };
         emitToolResult("checkout_cart", data, `Order ${orderId} confirmed -- $${order.total.toFixed(2)}`, false, start);
-        return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], structuredContent: data };
       }
 
       // Over threshold: reuse an outstanding approval rather than sending a
@@ -734,19 +791,21 @@ export function registerTools(server: McpServer): void {
       const existing = findPendingCheckout(userEmail);
       if (existing) {
         const data = {
-          error: "step_up_required",
+          status: "awaiting_approval",
           message:
             "A checkout for this cart is already waiting for approval on the buyer's " +
-            "device. Do not start another one. Tell the user to approve the existing " +
-            "push, then call complete_ciba_checkout with the auth_req_id below.",
+            "device. Do not start another one. The user can see a live approval card. " +
+            "Briefly ask them to approve the existing push, then call " +
+            "complete_ciba_checkout with the auth_req_id below.",
           auth_req_id: existing.auth_req_id,
           expires_in: Math.max(0, Math.round((existing.checkout.expires_at - Date.now()) / 1000)),
           total: existing.checkout.total,
           ciba_required: true,
           already_pending: true,
+          ...checkoutPayload(existing.auth_req_id, existing.checkout),
         };
-        emitToolResult("checkout_cart", data, "CIBA already pending -- reusing auth_req_id", true, start);
-        return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], isError: true };
+        emitToolResult("checkout_cart", data, "CIBA already pending -- reusing auth_req_id", false, start);
+        return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], structuredContent: data };
       }
 
       // Over threshold: initiate CIBA
@@ -768,32 +827,38 @@ export function registerTools(server: McpServer): void {
           binding_message: bindingMessage,
         });
 
-        pendingCibaCheckouts.set(ciba.auth_req_id, {
+        const checkout: PendingCibaCheckout = {
           user_email: userEmail,
           items: cart.items.map((i) => ({ ...i })),
           total: cart.total,
           initiated_at: new Date().toISOString(),
           expires_at: Date.now() + ciba.expires_in * 1000,
-        });
+          binding_message: bindingMessage,
+          status: "awaiting_approval",
+        };
+        pendingCibaCheckouts.set(ciba.auth_req_id, checkout);
 
+        // Not an error: approval is an expected step. The user sees a live
+        // approval card; the model is told what to do next.
         const data = {
-          error: "step_up_required",
+          status: "awaiting_approval",
           message:
             `This purchase is $${cart.total.toFixed(2)}, which exceeds the $${CIBA_REQUIRED_ABOVE} ` +
-            "auto-approval threshold. A push notification was just sent to the " +
-            "buyer's enrolled device. Tell the user to approve the push on their " +
-            "device, then immediately call complete_ciba_checkout with the " +
-            "auth_req_id below -- that tool will block and poll for up to 25s " +
-            "until the user approves. Do not wait for the user to reply first.",
+            "auto-approval threshold, so a push notification was sent to the buyer's " +
+            "enrolled device. The user can see a live approval card that updates on " +
+            "its own. Briefly ask them to approve the push, then immediately call " +
+            "complete_ciba_checkout with the auth_req_id below -- it waits up to 25s " +
+            "for approval. Do not wait for the user to reply first.",
           auth_req_id: ciba.auth_req_id,
           expires_in: ciba.expires_in,
           interval: ciba.interval,
           binding_message: bindingMessage,
           total: cart.total,
           ciba_required: true,
+          ...checkoutPayload(ciba.auth_req_id, checkout),
         };
-        emitToolResult("checkout_cart", data, `CIBA initiated for $${cart.total.toFixed(2)}`, true, start);
-        return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], isError: true };
+        emitToolResult("checkout_cart", data, `CIBA initiated for $${cart.total.toFixed(2)}`, false, start);
+        return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], structuredContent: data };
       } catch (err) {
         const payload = { error: "ciba_initiate_failed", message: (err as Error).message };
         emitToolResult("checkout_cart", payload, payload.message, true, start);
@@ -816,6 +881,7 @@ export function registerTools(server: McpServer): void {
       inputSchema: {
         auth_req_id: z.string().describe("The auth_req_id returned by checkout_cart"),
       },
+      _meta: checkoutUiToolMeta,
     },
     async ({ auth_req_id }, { authInfo }) => {
       const start = Date.now();
@@ -825,7 +891,7 @@ export function registerTools(server: McpServer): void {
         return { content: [{ type: "text" as const, text: JSON.stringify({ error: "permission_denied", message: auth.denied }) }], isError: true };
       }
 
-      const pending = pendingCibaCheckouts.get(auth_req_id);
+      const pending = getCheckout(auth_req_id);
       if (!pending) {
         const err = {
           error: "unknown_auth_req_id",
@@ -843,6 +909,20 @@ export function registerTools(server: McpServer): void {
         };
         emitToolResult("complete_ciba_checkout", err, "Owner mismatch", true, start);
         return { content: [{ type: "text" as const, text: JSON.stringify(err) }], isError: true };
+      }
+
+      // Already settled (e.g. the model retried after the order landed).
+      if (pending.status !== "awaiting_approval") {
+        const data = {
+          status: pending.status,
+          ...(pending.order ? { order_id: pending.order.order_id, total: pending.order.total } : {}),
+          message: pending.status === "confirmed"
+            ? `Order ${pending.order?.order_id} is already confirmed. Do not call this tool again.`
+            : `This checkout ended (${pending.status}). Start a new one with checkout_cart if the user wants to retry.`,
+          ...checkoutPayload(auth_req_id, pending),
+        };
+        emitToolResult("complete_ciba_checkout", data, `Checkout already ${pending.status}`, false, start);
+        return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], structuredContent: data };
       }
 
       // Poll for up to ~25s so Claude can call this tool once and block until
@@ -870,23 +950,36 @@ export function registerTools(server: McpServer): void {
 
       if (outcome.status === "pending" || outcome.status === "slow_down") {
         const data = {
-          error: "authorization_pending",
-          status: outcome.status,
-          message: "The user has not approved the push yet. Wait the recommended interval, then call complete_ciba_checkout again with the same auth_req_id.",
+          status: "awaiting_approval",
+          message:
+            "The user has not approved the push yet. Their approval card is still live. " +
+            "Call complete_ciba_checkout again with the same auth_req_id; don't repeat " +
+            "instructions to the user.",
           retry_in_seconds: outcome.recommendedIntervalSeconds,
+          ...checkoutPayload(auth_req_id, pending),
         };
-        emitToolResult("complete_ciba_checkout", data, `CIBA ${outcome.status}`, true, start);
-        return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], isError: true };
+        emitToolResult("complete_ciba_checkout", data, `CIBA ${outcome.status}`, false, start);
+        return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], structuredContent: data };
       }
 
       if (outcome.status === "denied" || outcome.status === "expired" || outcome.status === "error") {
-        pendingCibaCheckouts.delete(auth_req_id);
+        settleCheckout(auth_req_id, outcome.status, { reason: outcome.reason });
         const data = {
-          error: outcome.status === "denied" ? "access_denied" : outcome.status,
-          message: outcome.reason,
+          status: outcome.status,
+          message:
+            outcome.status === "denied"
+              ? "The user declined the purchase on their device. No order was placed and the cart is unchanged."
+              : outcome.status === "expired"
+                ? "The approval request expired. No order was placed and the cart is unchanged."
+                : `Checkout failed: ${outcome.reason}. No order was placed.`,
+          ...checkoutPayload(auth_req_id, pending),
         };
-        emitToolResult("complete_ciba_checkout", data, outcome.reason, true, start);
-        return { content: [{ type: "text" as const, text: JSON.stringify(data) }], isError: true };
+        emitToolResult("complete_ciba_checkout", data, outcome.reason, outcome.status === "error", start);
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
+          structuredContent: data,
+          ...(outcome.status === "error" ? { isError: true } : {}),
+        };
       }
 
       // status === "approved" -- finalize the order using the snapshot
@@ -900,8 +993,9 @@ export function registerTools(server: McpServer): void {
         created_at: new Date().toISOString(),
       };
       orders.set(orderId, order);
-      lastOrderByUser.set(userEmail, { order_id: orderId, total: order.total, created_at: order.created_at });
-      pendingCibaCheckouts.delete(auth_req_id);
+      const placed = { order_id: orderId, total: order.total, created_at: order.created_at };
+      lastOrderByUser.set(userEmail, placed);
+      settleCheckout(auth_req_id, "confirmed", { order: placed });
       clearCart(userEmail);
 
       const data = {
@@ -912,9 +1006,42 @@ export function registerTools(server: McpServer): void {
         ciba_required: true,
         ciba_approved: true,
         message: `Order ${orderId} confirmed for $${order.total.toFixed(2)} after CIBA approval.`,
+        ...checkoutPayload(auth_req_id, pending),
       };
       emitToolResult("complete_ciba_checkout", data, `Order ${orderId} confirmed via CIBA`, false, start);
-      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], structuredContent: data };
+    }
+  );
+
+  // ── get_checkout_status (checkout view only) ─────────────────────
+  server.registerTool(
+    "get_checkout_status",
+    {
+      title: "Get Checkout Status (UI)",
+      description:
+        "Used only by the RetailZero checkout view to refresh an approval card. " +
+        "Reads the current state of a checkout; never places or approves an order. " +
+        "Assistants should use complete_ciba_checkout instead.",
+      inputSchema: {
+        auth_req_id: z.string().describe("The auth_req_id shown on the checkout card"),
+      },
+      _meta: { ui: { visibility: ["app"] } },
+    },
+    async ({ auth_req_id }, { authInfo }) => {
+      const start = Date.now();
+      if (!authInfo?.scopes.includes("tool:checkout_cart")) {
+        const denied = "Permission denied: missing tool scope 'tool:checkout_cart'.";
+        emitToolResult("get_checkout_status", { error: "permission_denied" }, denied, true, start);
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "permission_denied", message: denied }) }], isError: true };
+      }
+
+      const checkout = getCheckout(auth_req_id);
+      if (!checkout || checkout.user_email !== getUserEmail(authInfo)) {
+        const err = { error: "not_found", message: "No checkout matches that request." };
+        return { content: [{ type: "text" as const, text: JSON.stringify(err) }], isError: true };
+      }
+      const data = checkoutPayload(auth_req_id, checkout);
+      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], structuredContent: data };
     }
   );
 
