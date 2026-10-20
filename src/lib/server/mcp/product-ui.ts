@@ -24,6 +24,12 @@ export const productUiToolMeta = {
  * The view is self-contained (no bundler, no CDN). It speaks the MCP Apps
  * postMessage JSON-RPC protocol directly: ui/initialize handshake, then
  * renders `structuredContent` from ui/notifications/tool-result.
+ *
+ * "Add to cart" buttons call the add_to_cart tool through the host
+ * (tools/call), so the request travels over the user's authenticated MCP
+ * session and goes through the same Auth0 scope check and token exchange
+ * as a model-initiated call. The result is then shared with the model via
+ * ui/update-model-context so the conversation knows the cart changed.
  */
 const PRODUCT_CARDS_HTML = /* html */ `<!doctype html>
 <html>
@@ -60,6 +66,13 @@ const PRODUCT_CARDS_HTML = /* html */ `<!doctype html>
   .detail .name { font-size: 18px; }
   .detail .desc { font-size: 13.5px; }
   .empty { padding: 16px; font-size: 13px; color: var(--muted); }
+  .add { margin-top: 8px; width: 100%; border: 0; border-radius: 8px; padding: 8px 10px; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; background: var(--accent); color: var(--card); transition: opacity .15s; }
+  .add:hover:not(:disabled) { opacity: .85; }
+  .add:disabled { cursor: default; opacity: .55; }
+  .add.done { background: var(--ok); color: #fff; opacity: 1; }
+  .add.err { background: transparent; color: var(--warn); border: 1px solid var(--warn); }
+  .msg { font-size: 11.5px; color: var(--warn); line-height: 1.35; }
+  .detail .add { width: auto; align-self: flex-start; padding: 9px 18px; }
   @media (max-width: 420px) { .detail { grid-template-columns: 1fr; } .detail img { min-height: 0; aspect-ratio: 1/1; } }
 </style>
 </head>
@@ -71,6 +84,7 @@ const PRODUCT_CARDS_HTML = /* html */ `<!doctype html>
   var nextId = 1;
   var pending = {};
   var root = document.getElementById("root");
+  var canCallTools = false;
 
   function send(msg) { window.parent.postMessage(msg, "*"); }
   function request(method, params) {
@@ -108,6 +122,9 @@ const PRODUCT_CARDS_HTML = /* html */ `<!doctype html>
         '<div class="row"><span class="price">' + money(p.price) + '</span>' +
         '<span class="rating">★ ' + esc(p.rating) + ' (' + esc(p.reviews) + ')</span></div>' +
         '<div class="stock' + (p.in_stock ? "" : " out") + '">' + (p.in_stock ? "In stock" : "Out of stock") + '</div>' +
+        (canCallTools && p.in_stock
+          ? '<button class="add" data-id="' + esc(p.id) + '" data-name="' + esc(p.name) + '">Add to cart</button><div class="msg" hidden></div>'
+          : "") +
       '</div></div>';
   }
 
@@ -130,6 +147,43 @@ const PRODUCT_CARDS_HTML = /* html */ `<!doctype html>
     });
     reportSize();
   }
+
+  function addToCart(btn) {
+    var id = btn.getAttribute("data-id");
+    var name = btn.getAttribute("data-name");
+    var msg = btn.nextElementSibling;
+    btn.disabled = true;
+    btn.className = "add";
+    btn.textContent = "Adding…";
+    msg.hidden = true;
+
+    request("tools/call", { name: "add_to_cart", arguments: { product_id: id, quantity: 1 } })
+      .then(function (result) {
+        var data = dataFromResult(result) || {};
+        if (result && result.isError) throw { message: data.message || "Could not add to cart." };
+        btn.className = "add done";
+        btn.textContent = "Added ✓";
+        var cart = data.cart || {};
+        var summary = "User clicked 'Add to cart' in the RetailZero product card: added 1x " + name +
+          " (" + id + "). Cart now has " + (cart.item_count != null ? cart.item_count : "?") +
+          " item(s), total " + (cart.total != null ? money(cart.total) : "unknown") + ".";
+        request("ui/update-model-context", { content: [{ type: "text", text: summary }] }).catch(function () {});
+        setTimeout(function () { btn.disabled = false; btn.className = "add"; btn.textContent = "Add another"; }, 2500);
+      })
+      .catch(function (err) {
+        btn.disabled = false;
+        btn.className = "add err";
+        btn.textContent = "Try again";
+        msg.textContent = (err && err.message) || "Could not add to cart.";
+        msg.hidden = false;
+        reportSize();
+      });
+  }
+
+  root.addEventListener("click", function (e) {
+    var btn = e.target.closest && e.target.closest("button.add");
+    if (btn && !btn.disabled) addToCart(btn);
+  });
 
   function dataFromResult(result) {
     if (!result) return null;
@@ -161,6 +215,7 @@ const PRODUCT_CARDS_HTML = /* html */ `<!doctype html>
     appCapabilities: {},
     protocolVersion: PROTOCOL_VERSION,
   }).then(function (result) {
+    canCallTools = !!(result && result.hostCapabilities && result.hostCapabilities.serverTools);
     applyTheme(result && result.hostContext);
     notify("ui/notifications/initialized");
   }).catch(function () {});

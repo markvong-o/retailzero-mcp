@@ -411,7 +411,7 @@ export function registerTools(server: McpServer): void {
         message: `Added ${quantity}x ${product_id} to your cart.`,
       };
       emitToolResult("add_to_cart", data, `Cart now $${result.total.toFixed(2)}`, false, start);
-      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], structuredContent: data };
     }
   );
 
