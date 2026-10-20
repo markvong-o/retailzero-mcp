@@ -13,7 +13,7 @@ import {
   type Cart,
 } from "@/lib/server/cart";
 import { initiateCiba, pollCiba } from "@/lib/server/ciba";
-import { productUiToolMeta, registerProductUi } from "@/lib/server/mcp/product-ui";
+import { productUiToolMeta, cartUiToolMeta, registerAppViews } from "@/lib/server/mcp/apps";
 
 /**
  * Threshold above which checkout requires CIBA step-up approval from the
@@ -155,6 +155,22 @@ function getUserEmail(authInfo: AuthInfo | undefined): string {
 }
 
 /**
+ * Cart payload shared by every cart tool, enriched with product images so
+ * the MCP Apps cart view can render line items without a second lookup.
+ */
+function cartPayload(cart: Cart) {
+  return {
+    items: cart.items.map((item) => ({
+      ...item,
+      image_url: PRODUCTS.find((p) => p.id === item.product_id)?.image_url,
+    })),
+    total: cart.total,
+    item_count: cart.items.reduce((s, i) => s + i.quantity, 0),
+    updated_at: cart.updated_at,
+  };
+}
+
+/**
  * Extract the Auth0 `sub` claim for use as a CIBA login_hint. Required so
  * Auth0 can route the push notification to the correct enrolled device.
  */
@@ -175,7 +191,7 @@ function getUserSub(authInfo: AuthInfo | undefined): string | null {
  * obtain a narrow, short-lived token scoped to just the operation.
  */
 export function registerTools(server: McpServer): void {
-  registerProductUi(server);
+  registerAppViews(server);
 
   // ── search_products ──────────────────────────────────────────────
   server.registerTool(
@@ -403,11 +419,7 @@ export function registerTools(server: McpServer): void {
 
       const data = {
         user: userEmail,
-        cart: {
-          items: result.items,
-          total: result.total,
-          item_count: result.items.reduce((s, i) => s + i.quantity, 0),
-        },
+        cart: cartPayload(result),
         message: `Added ${quantity}x ${product_id} to your cart.`,
       };
       emitToolResult("add_to_cart", data, `Cart now $${result.total.toFixed(2)}`, false, start);
@@ -424,6 +436,7 @@ export function registerTools(server: McpServer): void {
         "Return the authenticated user's current shopping cart, including line " +
         "items, quantities, and running total. Requires the read:cart scope.",
       inputSchema: {},
+      _meta: cartUiToolMeta,
     },
     async (_params, { authInfo }) => {
       const start = Date.now();
@@ -437,13 +450,11 @@ export function registerTools(server: McpServer): void {
       const cart = getCart(userEmail);
       const data = {
         user: userEmail,
-        items: cart.items,
-        total: cart.total,
-        item_count: cart.items.reduce((s, i) => s + i.quantity, 0),
+        ...cartPayload(cart),
         ciba_required_above: CIBA_REQUIRED_ABOVE,
       };
       emitToolResult("view_cart", data, `${cart.items.length} line item(s), $${cart.total.toFixed(2)}`, false, start);
-      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], structuredContent: data };
     }
   );
 
@@ -477,11 +488,11 @@ export function registerTools(server: McpServer): void {
 
       const data = {
         user: userEmail,
-        cart: { items: result.items, total: result.total, item_count: result.items.reduce((s, i) => s + i.quantity, 0) },
+        cart: cartPayload(result),
         message: quantity === 0 ? `Removed ${product_id} from cart.` : `Updated ${product_id} to quantity ${quantity}.`,
       };
       emitToolResult("update_cart_item", data, `Cart now $${result.total.toFixed(2)}`, false, start);
-      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], structuredContent: data };
     }
   );
 
@@ -514,11 +525,11 @@ export function registerTools(server: McpServer): void {
 
       const data = {
         user: userEmail,
-        cart: { items: result.items, total: result.total, item_count: result.items.reduce((s, i) => s + i.quantity, 0) },
+        cart: cartPayload(result),
         message: `Removed ${product_id} from cart.`,
       };
       emitToolResult("remove_from_cart", data, `Cart now $${result.total.toFixed(2)}`, false, start);
-      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], structuredContent: data };
     }
   );
 
@@ -540,10 +551,9 @@ export function registerTools(server: McpServer): void {
       }
 
       const userEmail = getUserEmail(authInfo);
-      clearCart(userEmail);
-      const data = { user: userEmail, message: "Cart cleared." };
+      const data = { user: userEmail, cart: cartPayload(clearCart(userEmail)), message: "Cart cleared." };
       emitToolResult("clear_cart", data, "Cart cleared", false, start);
-      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], structuredContent: data };
     }
   );
 
