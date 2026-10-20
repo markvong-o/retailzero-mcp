@@ -13,6 +13,14 @@ import { MCP_APP_MIME_TYPE, buildViewHtml, toolUiMeta, viewResourceMeta } from "
  * Old cart cards in the transcript would otherwise show a stale snapshot,
  * so the view re-fetches view_cart on load and keeps whichever copy has the
  * newest `updated_at`.
+ *
+ * Checkout state comes from the server (`cart.checkout`), not from the
+ * card, so every cart card agrees. Clicking Check out first calls the
+ * app-only request_checkout tool, which marks the checkout as requested
+ * server-side; the card the model renders next (via view_cart) therefore
+ * opens already locked. The lock holds through the CIBA approval and
+ * clears when the order lands. Cards poll view_cart while checkout is in
+ * flight so older cards in the transcript catch up too.
  */
 export const CART_UI_URI = "ui://retailzero/cart.html";
 export const cartUiToolMeta = toolUiMeta(CART_UI_URI);
@@ -39,6 +47,13 @@ const CSS = /* css */ `
   .actions .btn.primary { flex: 1; padding: 10px 14px; }
   .busy { opacity: .6; pointer-events: none; }
   .msg { padding: 0 16px 10px; }
+  .status { display: flex; gap: 10px; align-items: flex-start; padding: 12px 14px; border-radius: 10px; font-size: 13px; line-height: 1.4; background: var(--soft); border: 1px solid var(--border); }
+  .status strong { display: block; font-size: 13.5px; margin-bottom: 2px; }
+  .status.ok { border-color: var(--ok); }
+  .status .dot { flex: none; width: 8px; height: 8px; margin-top: 6px; border-radius: 50%; background: var(--warn); animation: pulse 1.4s ease-in-out infinite; }
+  .status.ok .dot { background: var(--ok); animation: none; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  .locked .step, .locked .remove { display: none; }
 `;
 
 const BODY = /* html */ `<div id="root" class="empty">Loading cart…</div>`;
@@ -48,6 +63,9 @@ const SCRIPT = /* js */ `
   var esc = rz.esc, money = rz.money;
   var cart = null;
   var error = "";
+  var loadedAt = Date.now();
+  var pollTimer = null;
+  var POLL_MS = 3000;
 
   function newer(a, b) {
     if (!a) return b;
@@ -65,7 +83,51 @@ const SCRIPT = /* js */ `
       item_count: c.item_count != null ? c.item_count : c.items.reduce(function (s, i) { return s + i.quantity; }, 0),
       updated_at: c.updated_at || "",
       ciba_required_above: data.ciba_required_above != null ? data.ciba_required_above : (cart && cart.ciba_required_above),
+      checkout: c.checkout || (cart && cart.checkout) || { status: null, pending: null, last_order: null },
     };
+  }
+
+  // All derived from server state:
+  // "pending"   - a CIBA approval is outstanding
+  // "requested" - the user clicked Check out; the model hasn't run checkout_cart yet
+  // "done"      - an order was placed while this card was open (or just before)
+  // "idle"      - nothing in flight
+  function checkoutState() {
+    var co = cart && cart.checkout;
+    if (!co) return "idle";
+    if (co.status === "awaiting_approval" || co.pending) return "pending";
+    if (co.status === "requested") return "requested";
+    if (co.last_order && !cart.items.length && Date.parse(co.last_order.created_at) >= loadedAt - 120000) return "done";
+    return "idle";
+  }
+
+  function schedulePoll() {
+    clearTimeout(pollTimer);
+    var s = checkoutState();
+    if (!rz.canCallTools() || (s !== "pending" && s !== "requested")) return;
+    pollTimer = setTimeout(function () {
+      rz.callTool("view_cart").then(function (data) {
+        var c = normalize(data);
+        if (c) { cart = c; render(); }
+      }).catch(function () {}).then(schedulePoll);
+    }, POLL_MS);
+  }
+
+  function statusHtml(s) {
+    var co = cart.checkout || {};
+    if (s === "pending") {
+      return '<div class="status"><span class="dot"></span><div><strong>Waiting for your approval</strong>' +
+        'Approve the ' + money(co.pending.total) + ' purchase in the push notification on your phone.</div></div>';
+    }
+    if (s === "requested") {
+      return '<div class="status"><span class="dot"></span><div><strong>Checkout in progress</strong>' +
+        'The assistant is placing your order. This cart is locked until it finishes.</div></div>';
+    }
+    if (s === "done" && co.last_order) {
+      return '<div class="status ok"><span class="dot"></span><div><strong>Order placed</strong>' +
+        esc(co.last_order.order_id) + ' · ' + money(co.last_order.total) + '</div></div>';
+    }
+    return "";
   }
 
   function lineHtml(i) {
@@ -89,33 +151,39 @@ const SCRIPT = /* js */ `
 
   function render() {
     if (!cart) return;
+    var state = checkoutState();
     if (!cart.items.length) {
-      root.className = "card empty";
-      root.textContent = "Your cart is empty.";
+      root.className = "card" + (state === "done" ? " foot" : " empty");
+      root.innerHTML = state === "done" ? statusHtml(state) : "Your cart is empty.";
       rz.reportSize();
+      schedulePoll();
       return;
     }
     var limit = cart.ciba_required_above;
     var needsApproval = limit != null && cart.total > limit;
-    root.className = "card cart";
+    var locked = state === "pending" || state === "requested";
+    root.className = "card cart" + (locked ? " locked" : "");
     root.innerHTML =
       '<div class="head"><h2>Your cart</h2><span class="count">' + cart.item_count + ' item' + (cart.item_count === 1 ? "" : "s") + '</span></div>' +
       cart.items.map(lineHtml).join("") +
       (error ? '<div class="msg">' + esc(error) + '</div>' : "") +
       '<div class="foot">' +
         '<div class="total"><span>Total</span><span>' + money(cart.total) + '</span></div>' +
-        (needsApproval
-          ? '<div class="note">Orders over ' + money(limit) + ' need your approval. You\\'ll get a push notification to confirm on your phone.</div>'
-          : "") +
-        '<div class="actions">' +
-          (rz.canMessage()
-            ? '<button class="btn primary" data-act="checkout">Check out</button>'
-            : '<div class="note">Ask the assistant to check out when you\\'re ready.</div>') +
-          (rz.canCallTools() ? '<button class="btn ghost" data-act="clear">Clear</button>' : "") +
-        '</div>' +
+        (locked
+          ? statusHtml(state)
+          : (needsApproval
+              ? '<div class="note">Orders over ' + money(limit) + ' need your approval. You\\'ll get a push notification to confirm on your phone.</div>'
+              : "") +
+            '<div class="actions">' +
+              (rz.canMessage()
+                ? '<button class="btn primary" data-act="checkout">Check out</button>'
+                : '<div class="note">Ask the assistant to check out when you\\'re ready.</div>') +
+              (rz.canCallTools() ? '<button class="btn ghost" data-act="clear">Clear</button>' : "") +
+            '</div>') +
       '</div>';
     rz.watchImages(root);
     rz.reportSize();
+    schedulePoll();
   }
 
   function apply(data) {
@@ -124,12 +192,14 @@ const SCRIPT = /* js */ `
   }
 
   function mutate(tool, args, describe) {
+    var st = checkoutState();
+    if (st === "pending" || st === "requested") return;
     error = "";
     root.classList.add("busy");
     rz.callTool(tool, args)
       .then(function (data) {
         // Mutation results are always the latest state.
-        var c = normalize(data) || { items: [], total: 0, item_count: 0 };
+        var c = normalize(data) || { items: [], total: 0, item_count: 0, checkout: cart && cart.checkout };
         c.ciba_required_above = cart && cart.ciba_required_above;
         cart = c;
         rz.updateModelContext(
@@ -158,12 +228,19 @@ const SCRIPT = /* js */ `
     else if (act === "remove") mutate("remove_from_cart", { product_id: id }, "removed " + name);
     else if (act === "clear") mutate("clear_cart", {}, "cleared the cart");
     else if (act === "checkout") {
+      if (checkoutState() !== "idle") return;
       el.disabled = true;
       el.textContent = "Starting checkout…";
-      rz.sendMessage("Check out my cart.").catch(function () {
-        el.disabled = false;
-        el.textContent = "Check out";
-      });
+      // Lock server-side first so the next cart card renders locked, then
+      // hand the actual checkout to the model.
+      rz.callTool("request_checkout")
+        .then(function (data) { var c = normalize(data); if (c) cart = c; render(); })
+        .catch(function () {})
+        .then(function () { return rz.sendMessage("Check out my cart."); })
+        .catch(function () {
+          el.disabled = false;
+          el.textContent = "Check out";
+        });
     }
   });
 

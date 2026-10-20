@@ -93,10 +93,12 @@ export const BRIDGE_JS = /* js */ `
   rz.money = function (n) {
     return "$" + Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   };
+  // Measure the body, not documentElement: documentElement.scrollHeight never
+  // drops below the iframe's current height, so cards could grow but not shrink.
   rz.reportSize = function () {
     notify("ui/notifications/size-changed", {
       width: document.documentElement.scrollWidth,
-      height: document.documentElement.scrollHeight,
+      height: Math.ceil(document.body.getBoundingClientRect().height),
     });
   };
   rz.watchImages = function (el) {

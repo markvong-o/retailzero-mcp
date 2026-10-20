@@ -32,8 +32,46 @@ interface PendingCibaCheckout {
   items: Cart["items"];
   total: number;
   initiated_at: string;
+  expires_at: number;
 }
 const pendingCibaCheckouts = new Map<string, PendingCibaCheckout>();
+
+/** Most recent confirmed order per user, surfaced in the cart view. */
+const lastOrderByUser = new Map<string, { order_id: string; total: number; created_at: string }>();
+
+/**
+ * When the user clicked Check out in a cart view. The model typically calls
+ * view_cart before checkout_cart, so this keeps the freshly rendered cart
+ * card locked during that gap. Cleared once checkout_cart runs; otherwise
+ * it lapses after CHECKOUT_REQUEST_TTL_MS.
+ */
+const checkoutRequestedAt = new Map<string, number>();
+const CHECKOUT_REQUEST_TTL_MS = 90_000;
+
+type CheckoutStatus = "awaiting_approval" | "requested" | null;
+
+function checkoutStatus(userEmail: string): CheckoutStatus {
+  if (findPendingCheckout(userEmail)) return "awaiting_approval";
+  const requested = checkoutRequestedAt.get(userEmail);
+  if (requested && Date.now() - requested < CHECKOUT_REQUEST_TTL_MS) return "requested";
+  checkoutRequestedAt.delete(userEmail);
+  return null;
+}
+
+/**
+ * The user's live (unexpired) pending CIBA checkout, if any. Expired
+ * entries are pruned so a timed-out approval unlocks checkout again.
+ */
+function findPendingCheckout(userEmail: string): { auth_req_id: string; checkout: PendingCibaCheckout } | null {
+  for (const [auth_req_id, checkout] of pendingCibaCheckouts) {
+    if (checkout.expires_at <= Date.now()) {
+      pendingCibaCheckouts.delete(auth_req_id);
+      continue;
+    }
+    if (checkout.user_email === userEmail) return { auth_req_id, checkout };
+  }
+  return null;
+}
 
 // In-memory order store (shared with orders.ts for consistency)
 const orders = new Map<
@@ -159,6 +197,7 @@ function getUserEmail(authInfo: AuthInfo | undefined): string {
  * the MCP Apps cart view can render line items without a second lookup.
  */
 function cartPayload(cart: Cart) {
+  const pending = findPendingCheckout(cart.user_email);
   return {
     items: cart.items.map((item) => ({
       ...item,
@@ -167,6 +206,19 @@ function cartPayload(cart: Cart) {
     total: cart.total,
     item_count: cart.items.reduce((s, i) => s + i.quantity, 0),
     updated_at: cart.updated_at,
+    // Lets every cart view (including older ones in the transcript) lock
+    // checkout while an approval is outstanding, and confirm once it lands.
+    checkout: {
+      status: checkoutStatus(cart.user_email),
+      pending: pending
+        ? {
+            total: pending.checkout.total,
+            initiated_at: pending.checkout.initiated_at,
+            expires_at: new Date(pending.checkout.expires_at).toISOString(),
+          }
+        : null,
+      last_order: lastOrderByUser.get(cart.user_email) ?? null,
+    },
   };
 }
 
@@ -557,6 +609,34 @@ export function registerTools(server: McpServer): void {
     }
   );
 
+  // ── request_checkout (cart view only) ────────────────────────────
+  server.registerTool(
+    "request_checkout",
+    {
+      title: "Request Checkout (UI)",
+      description:
+        "Used only by the RetailZero cart view to record that the user clicked " +
+        "Check out, so every open cart card locks its button. It does not place " +
+        "an order. Assistants should not call this; use checkout_cart instead.",
+      inputSchema: {},
+      _meta: { ui: { visibility: ["app"] } },
+    },
+    async (_params, { authInfo }) => {
+      const start = Date.now();
+      if (!authInfo?.scopes.includes("tool:checkout_cart")) {
+        const denied = "Permission denied: missing tool scope 'tool:checkout_cart'.";
+        emitToolResult("request_checkout", { error: "permission_denied" }, denied, true, start);
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: "permission_denied", message: denied }) }], isError: true };
+      }
+
+      const userEmail = getUserEmail(authInfo);
+      if (!findPendingCheckout(userEmail)) checkoutRequestedAt.set(userEmail, Date.now());
+      const data = { user: userEmail, cart: cartPayload(getCart(userEmail)) };
+      emitToolResult("request_checkout", data, "Checkout requested from cart view", false, start);
+      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], structuredContent: data };
+    }
+  );
+
   // ── checkout_cart ────────────────────────────────────────────────
   server.registerTool(
     "checkout_cart",
@@ -581,6 +661,9 @@ export function registerTools(server: McpServer): void {
 
       const userEmail = getUserEmail(authInfo);
       const cart = getCart(userEmail);
+      // The checkout is now in progress: either it finishes here, fails here,
+      // or hands off to a pending CIBA approval that keeps carts locked.
+      checkoutRequestedAt.delete(userEmail);
 
       if (cart.items.length === 0) {
         const err = { error: "cart_empty", message: "Cart is empty. Add items before checking out." };
@@ -614,6 +697,7 @@ export function registerTools(server: McpServer): void {
           created_at: new Date().toISOString(),
         };
         orders.set(orderId, order);
+        lastOrderByUser.set(userEmail, { order_id: orderId, total: order.total, created_at: order.created_at });
         clearCart(userEmail);
 
         const data = {
@@ -626,6 +710,26 @@ export function registerTools(server: McpServer): void {
         };
         emitToolResult("checkout_cart", data, `Order ${orderId} confirmed -- $${order.total.toFixed(2)}`, false, start);
         return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+      }
+
+      // Over threshold: reuse an outstanding approval rather than sending a
+      // second push (e.g. the user clicked Check out twice).
+      const existing = findPendingCheckout(userEmail);
+      if (existing) {
+        const data = {
+          error: "step_up_required",
+          message:
+            "A checkout for this cart is already waiting for approval on the buyer's " +
+            "device. Do not start another one. Tell the user to approve the existing " +
+            "push, then call complete_ciba_checkout with the auth_req_id below.",
+          auth_req_id: existing.auth_req_id,
+          expires_in: Math.max(0, Math.round((existing.checkout.expires_at - Date.now()) / 1000)),
+          total: existing.checkout.total,
+          ciba_required: true,
+          already_pending: true,
+        };
+        emitToolResult("checkout_cart", data, "CIBA already pending -- reusing auth_req_id", true, start);
+        return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }], isError: true };
       }
 
       // Over threshold: initiate CIBA
@@ -652,6 +756,7 @@ export function registerTools(server: McpServer): void {
           items: cart.items.map((i) => ({ ...i })),
           total: cart.total,
           initiated_at: new Date().toISOString(),
+          expires_at: Date.now() + ciba.expires_in * 1000,
         });
 
         const data = {
@@ -778,6 +883,7 @@ export function registerTools(server: McpServer): void {
         created_at: new Date().toISOString(),
       };
       orders.set(orderId, order);
+      lastOrderByUser.set(userEmail, { order_id: orderId, total: order.total, created_at: order.created_at });
       pendingCibaCheckouts.delete(auth_req_id);
       clearCart(userEmail);
 
