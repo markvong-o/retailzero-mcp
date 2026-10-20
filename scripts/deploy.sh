@@ -24,7 +24,7 @@ echo "==> Building"
 npm run build
 
 echo "==> Restarting $APP_NAME"
+# pm2 restart prints the process table itself, so no separate status call.
 pm2 restart "$APP_NAME" --update-env
 
-pm2 status "$APP_NAME"
 echo "==> Done"
