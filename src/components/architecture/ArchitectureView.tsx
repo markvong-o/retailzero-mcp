@@ -4,11 +4,13 @@ import React, { useState } from "react";
 import { ChatGPTFlowDiagram } from "./ChatGPTFlowDiagram";
 import { GeminiFlowDiagram } from "./GeminiFlowDiagram";
 import { GeminiUCPMCPFlowDiagram } from "./GeminiUCPMCPFlowDiagram";
+import { GenericMcpFlowDiagram } from "./GenericMcpFlowDiagram";
 
 const TABS = [
   { id: "chatgpt", label: "ChatGPT App (MCP + ACP)", color: "#10a37f" },
   { id: "gemini", label: "Gemini (UCP)", color: "#4285f4" },
   { id: "gemini-ucp-mcp", label: "Gemini (UCP-over-MCP)", color: "#9C27B0" },
+  { id: "generic-mcp", label: "Generic MCP Client", color: "#64748b" },
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
@@ -61,8 +63,10 @@ export function ArchitectureView() {
             <ChatGPTFlowDiagram />
           ) : activeTab === "gemini" ? (
             <GeminiFlowDiagram />
-          ) : (
+          ) : activeTab === "gemini-ucp-mcp" ? (
             <GeminiUCPMCPFlowDiagram />
+          ) : (
+            <GenericMcpFlowDiagram />
           )}
         </div>
       </main>

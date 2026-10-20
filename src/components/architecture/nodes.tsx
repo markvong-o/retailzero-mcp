@@ -69,8 +69,8 @@ export const Auth0Node = memo(function Auth0Node({ data }: NodeProps & { data: A
       <Handle type="target" position={Position.Top} id="top-right" className={H} style={{ left: "70%" }} />
 
       {/* Right targets (spread) */}
-      <Handle type="target" position={Position.Right} id="right-top" className={H} style={{ top: "35%" }} />
-      <Handle type="target" position={Position.Right} id="right-bottom" className={H} style={{ top: "65%" }} />
+      <Handle type="target" position={Position.Right} id="right-top" className={H} style={{ top: "22%" }} />
+      <Handle type="target" position={Position.Right} id="right-bottom" className={H} style={{ top: "78%" }} />
 
       {/* Left source */}
       <Handle type="source" position={Position.Left} id="left" className={H} />
@@ -110,6 +110,8 @@ export const ToolsNode = memo(function ToolsNode({ data }: NodeProps & { data: T
       <Handle type="target" position={Position.Top} id="top" className={H} />
       <Handle type="source" position={Position.Bottom} id="bottom" className={H} />
       <Handle type="source" position={Position.Left} id="left" className={H} />
+      <Handle type="target" position={Position.Bottom} id="bottom-in-left" className={H} style={{ left: "28%" }} />
+      <Handle type="target" position={Position.Bottom} id="bottom-in-right" className={H} style={{ left: "72%" }} />
       <div className="text-[11px] font-semibold mb-2" style={{ color: data.accentColor }}>
         {data.title}
       </div>
