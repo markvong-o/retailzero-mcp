@@ -13,6 +13,7 @@ import {
   type Cart,
 } from "@/lib/server/cart";
 import { initiateCiba, pollCiba } from "@/lib/server/ciba";
+import { DEMO_PERSONA, ensurePersonaSeed, getUserKey, userSuffix } from "@/lib/server/mcp/user-identity";
 import { productUiToolMeta, cartUiToolMeta, registerAppViews } from "@/lib/server/mcp/apps";
 
 /**
@@ -185,11 +186,27 @@ async function authorizeToolCall(
   }
 }
 
+/** The demo persona's past orders, copied to each new user on first sight. */
+const PERSONA_ORDERS = Array.from(orders.values()).filter((o) => o.buyer_email === DEMO_PERSONA);
+const ordersSeededFor = new Set<string>([DEMO_PERSONA]);
+
 /**
- * Extract user email from authInfo extra claims.
+ * Resolve the calling user from the access token (email claim if present,
+ * otherwise `sub`) and make sure they have their own copy of the demo
+ * persona's wishlist, preferences and past orders. All per-user stores
+ * (carts, wishlists, orders) are keyed by this value.
  */
 function getUserEmail(authInfo: AuthInfo | undefined): string {
-  return (authInfo?.extra?.email as string) || "alex@example.com";
+  const userKey = getUserKey(authInfo);
+  ensurePersonaSeed(userKey);
+  if (!ordersSeededFor.has(userKey)) {
+    ordersSeededFor.add(userKey);
+    for (const o of PERSONA_ORDERS) {
+      const order_id = `${o.order_id}_${userSuffix(userKey)}`;
+      orders.set(order_id, { ...o, order_id, buyer_email: userKey, items: o.items.map((i) => ({ ...i })) });
+    }
+  }
+  return userKey;
 }
 
 /**

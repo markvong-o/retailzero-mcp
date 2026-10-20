@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { PRODUCTS, WISHLISTS } from "@/lib/server/products";
+import { ensurePersonaSeed, getUserKey } from "@/lib/server/mcp/user-identity";
 import { eventBus } from "@/lib/server/event-bus";
 import { exchangeToken } from "@/lib/server/token-exchange";
 
@@ -111,8 +112,11 @@ async function authorizeToolCall(
   }
 }
 
+/** Resolve the calling user (email claim, else `sub`) and seed their demo wishlist. */
 function getUserEmail(authInfo: AuthInfo | undefined): string {
-  return (authInfo?.extra?.email as string) || "alex@example.com";
+  const userKey = getUserKey(authInfo);
+  ensurePersonaSeed(userKey);
+  return userKey;
 }
 
 /* ------------------------------------------------------------------ */
