@@ -7,6 +7,14 @@ export interface Product {
   rating: number;
   reviews: number;
   in_stock: boolean;
+  /** Absolute URL to the product image, served from /public/products. */
+  image_url: string;
+}
+
+const BASE_URL = process.env.APP_BASE_URL || "http://localhost:3000";
+
+function productImage(id: string): string {
+  return `${BASE_URL}/products/${id}.jpg`;
 }
 
 export const WISHLISTS = new Map<string, string[]>([
@@ -30,6 +38,7 @@ export const PRODUCTS: Product[] = [
     rating: 4.6,
     reviews: 128,
     in_stock: true,
+    image_url: productImage("scarf_cashmere_001"),
   },
   {
     id: "jacket_denim_001",
@@ -40,6 +49,7 @@ export const PRODUCTS: Product[] = [
     rating: 4.4,
     reviews: 203,
     in_stock: true,
+    image_url: productImage("jacket_denim_001"),
   },
   {
     id: "bag_weekender_001",
@@ -50,6 +60,7 @@ export const PRODUCTS: Product[] = [
     rating: 4.9,
     reviews: 67,
     in_stock: true,
+    image_url: productImage("bag_weekender_001"),
   },
   {
     id: "bag_city_001",
@@ -60,6 +71,7 @@ export const PRODUCTS: Product[] = [
     rating: 4.5,
     reviews: 156,
     in_stock: true,
+    image_url: productImage("bag_city_001"),
   },
   {
     id: "bag_satchel_001",
@@ -70,6 +82,7 @@ export const PRODUCTS: Product[] = [
     rating: 4.8,
     reviews: 72,
     in_stock: true,
+    image_url: productImage("bag_satchel_001"),
   },
   {
     id: "bag_heritage_001",
@@ -80,6 +93,7 @@ export const PRODUCTS: Product[] = [
     rating: 4.7,
     reviews: 93,
     in_stock: true,
+    image_url: productImage("bag_heritage_001"),
   },
   {
     id: "watch_meridian_001",
@@ -90,6 +104,7 @@ export const PRODUCTS: Product[] = [
     rating: 4.9,
     reviews: 31,
     in_stock: true,
+    image_url: productImage("watch_meridian_001"),
   },
   {
     id: "blazer_silk_001",
@@ -100,6 +115,7 @@ export const PRODUCTS: Product[] = [
     rating: 4.3,
     reviews: 88,
     in_stock: true,
+    image_url: productImage("blazer_silk_001"),
   },
   {
     id: "sneakers_canvas_001",
@@ -110,6 +126,7 @@ export const PRODUCTS: Product[] = [
     rating: 4.2,
     reviews: 312,
     in_stock: true,
+    image_url: productImage("sneakers_canvas_001"),
   },
   {
     id: "shirt_linen_001",
@@ -120,5 +137,6 @@ export const PRODUCTS: Product[] = [
     rating: 4.6,
     reviews: 95,
     in_stock: true,
+    image_url: productImage("shirt_linen_001"),
   },
 ];

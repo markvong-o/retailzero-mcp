@@ -13,6 +13,7 @@ import {
   type Cart,
 } from "@/lib/server/cart";
 import { initiateCiba, pollCiba } from "@/lib/server/ciba";
+import { productUiToolMeta, registerProductUi } from "@/lib/server/mcp/product-ui";
 
 /**
  * Threshold above which checkout requires CIBA step-up approval from the
@@ -174,6 +175,8 @@ function getUserSub(authInfo: AuthInfo | undefined): string | null {
  * obtain a narrow, short-lived token scoped to just the operation.
  */
 export function registerTools(server: McpServer): void {
+  registerProductUi(server);
+
   // ── search_products ──────────────────────────────────────────────
   server.registerTool(
     "search_products",
@@ -191,6 +194,7 @@ export function registerTools(server: McpServer): void {
         max_price: z.number().optional().describe("Maximum price filter"),
         min_price: z.number().optional().describe("Minimum price filter"),
       },
+      _meta: productUiToolMeta,
     },
     async ({ query, category, max_price, min_price }) => {
       const start = Date.now();
@@ -225,6 +229,7 @@ export function registerTools(server: McpServer): void {
           rating: p.rating,
           reviews: p.reviews,
           in_stock: p.in_stock,
+          image_url: p.image_url,
         })),
         total: results.length,
       };
@@ -233,6 +238,7 @@ export function registerTools(server: McpServer): void {
 
       return {
         content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
+        structuredContent: data,
       };
     }
   );
@@ -244,10 +250,11 @@ export function registerTools(server: McpServer): void {
       title: "Get Product Details",
       description:
         "Get full details for a specific product by ID, including description, " +
-        "price, rating, review count, and stock status.",
+        "price, rating, review count, stock status, and image URL.",
       inputSchema: {
         product_id: z.string().describe("The product ID (e.g. 'bag_heritage_001')"),
       },
+      _meta: productUiToolMeta,
     },
     async ({ product_id }) => {
       const start = Date.now();
@@ -268,6 +275,7 @@ export function registerTools(server: McpServer): void {
       emitToolResult("get_product_details", product, `${product.name} -- $${product.price}`, false, start);
       return {
         content: [{ type: "text" as const, text: JSON.stringify(product, null, 2) }],
+        structuredContent: { ...product },
       };
     }
   );
